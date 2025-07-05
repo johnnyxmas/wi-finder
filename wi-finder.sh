@@ -342,10 +342,33 @@ scan_open_networks() {
     
     log "info" "Starting WiFi scan on interface $interface"
     
+    # Check interface mode and set to managed if needed
+    local current_mode
+    current_mode=$(iw dev "$interface" info 2>/dev/null | grep "type" | awk '{print $2}')
+    if [ "$current_mode" = "monitor" ]; then
+        log "info" "Interface $interface is in monitor mode, switching to managed mode for scanning"
+        if ! iw dev "$interface" set type managed 2>/dev/null; then
+            log "warn" "Failed to set interface to managed mode, attempting scan anyway"
+        fi
+    fi
+    
+    # Ensure interface is up
+    if ! ip link set "$interface" up 2>/dev/null; then
+        log "warn" "Failed to bring interface $interface up"
+    fi
+    
     # Scan and sort by signal strength (strongest first)
     local scan_result
-    if ! scan_result=$(iw dev "$interface" scan 2>&1); then
-        log "error" "WiFi scan failed on interface $interface: $scan_result"
+    if ! scan_result=$(iw dev "$interface" scan 2>/dev/null); then
+        log "error" "WiFi scan failed on interface $interface - interface may not support scanning"
+        echo ""  # Return empty result
+        return 1
+    fi
+    
+    # Check if scan result contains actual BSS entries
+    if ! echo "$scan_result" | grep -q "^BSS"; then
+        log "warn" "No BSS entries found in scan result"
+        echo ""
         return 1
     fi
     
@@ -355,7 +378,7 @@ scan_open_networks() {
         BEGIN { ssid = ""; signal = ""; privacy = 0 }
         /^BSS/ {
             # Process previous entry if complete
-            if (ssid && !privacy && signal) {
+            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/) {
                 print signal " " ssid
             }
             # Reset for new BSS
@@ -364,38 +387,45 @@ scan_open_networks() {
         /SSID:/ {
             gsub(/.*SSID: /, "");
             gsub(/\t/, "");
-            if ($0 != "" && $0 != "\\x00") ssid = $0
+            gsub(/\r/, "");
+            # Skip empty, null, or hidden SSIDs
+            if ($0 != "" && $0 != "\\x00" && $0 !~ /^[[:space:]]*$/) {
+                ssid = $0
+            }
         }
         /signal:/ {
             gsub(/.*signal: /, "");
             gsub(/ dBm.*/, "");
-            signal = $0
+            if ($0 ~ /^-?[0-9]+$/) {
+                signal = $0
+            }
         }
         /capability:.*Privacy/ { privacy = 1 }
         END {
             # Process final entry
-            if (ssid && !privacy && signal) {
+            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/) {
                 print signal " " ssid
             }
         }' | \
         sort -nr | \
-        awk '{$1=""; print substr($0,2)}')
+        awk '{$1=""; gsub(/^[[:space:]]+/, ""); print}' | \
+        grep -v '^[[:space:]]*$')
     
-    # Filter out empty lines and count
-    networks=$(echo "$networks" | grep -v '^[[:space:]]*$')
-    local network_count=$(echo "$networks" | wc -l)
+    local network_count=0
+    if [ -n "$networks" ]; then
+        network_count=$(echo "$networks" | wc -l)
+    fi
     
-    if [ -n "$networks" ] && [ "$network_count" -gt 0 ]; then
+    if [ "$network_count" -gt 0 ]; then
         log "info" "Found $network_count open networks:"
         echo "$networks" | while read -r network; do
             [ -n "$network" ] && log "info" "  - $network"
         done
+        echo "$networks"
     else
         log "warn" "No open networks found in scan"
-        networks=""  # Ensure empty if no valid networks
+        echo ""
     fi
-    
-    echo "$networks"
 }
 
 connect_to_network() {
