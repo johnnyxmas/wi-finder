@@ -160,7 +160,8 @@ install_dependencies() {
 }
 
 check_internet() {
-    if verify_internet; then
+    local interface=$1
+    if verify_internet "$interface"; then
         log "info" "Already connected to internet, starting monitoring mode"
         return 0
     fi
@@ -354,20 +355,31 @@ connect_to_network() {
 }
 
 check_captive_portal() {
-    log "info" "ATTEMPT: Testing for captive portal using neverssl.com"
+    local interface=$1
+    log "info" "ATTEMPT: Testing for captive portal using neverssl.com via interface $interface"
+    
+    # Get the IP address of the WiFi interface
+    local wifi_ip=$(ip addr show "$interface" | grep -oP 'inet \K[\d.]+' | head -1)
+    if [ -z "$wifi_ip" ]; then
+        log "error" "FAILURE: No IP address found on WiFi interface $interface"
+        return 1
+    fi
+    
+    log "debug" "Using WiFi interface $interface with IP $wifi_ip for connectivity test"
+    
     local response
-    response=$(curl -s --max-time 5 http://neverssl.com 2>&1 || true)
+    response=$(curl -s --max-time 5 --interface "$interface" http://neverssl.com 2>&1 || true)
     
     if [ -z "$response" ]; then
-        log "error" "FAILURE: No response from neverssl.com - possible connectivity issue"
+        log "error" "FAILURE: No response from neverssl.com via WiFi interface $interface"
         return 1
     fi
     
     if echo "$response" | grep -q "This website is for when you try to open Facebook"; then
-        log "info" "SUCCESS: neverssl test passed - no captive portal detected"
+        log "info" "SUCCESS: neverssl test passed via WiFi interface $interface - no captive portal detected"
         return 0  # No captive portal - test succeeded
     else
-        log "warn" "FAILURE: neverssl test failed - captive portal detected or blocked"
+        log "warn" "FAILURE: neverssl test failed via WiFi interface $interface - captive portal detected or blocked"
         log "debug" "Response received: ${response:0:200}..."  # Log first 200 chars
         return 1  # Captive portal detected - test failed
     fi
@@ -483,12 +495,13 @@ spoof_mac() {
 }
 
 verify_internet() {
+    local interface=$1
     # First do the neverssl test as specified in the flow
-    if check_captive_portal; then
-        log "info" "neverssl test succeeded - internet access confirmed"
+    if check_captive_portal "$interface"; then
+        log "info" "neverssl test succeeded via $interface - internet access confirmed"
         return 0
     else
-        log "warn" "neverssl test failed - captive portal detected or no internet"
+        log "warn" "neverssl test failed via $interface - captive portal detected or no internet"
         return 1
     fi
 }
@@ -537,7 +550,7 @@ scan_and_connect() {
             if connect_to_network "$interface" "$network"; then
                 log "info" "Network connection established, testing internet access..."
                 
-                if verify_internet; then
+                if verify_internet "$interface"; then
                     log "info" "SUCCESS: Connected to '$network' with full internet access!"
                     log "info" "=== CONNECTION SUCCESSFUL - ENTERING MONITORING MODE ==="
                     return 0
@@ -569,7 +582,7 @@ scan_and_connect() {
                         
                         if spoof_mac "$interface" "$mac"; then
                             if connect_to_network "$interface" "$network"; then
-                                if verify_internet; then
+                                if verify_internet "$interface"; then
                                     log "info" "SUCCESS: Bypassed captive portal on '$network' using MAC $mac"
                                     log "info" "=== CAPTIVE PORTAL BYPASS SUCCESSFUL - ENTERING MONITORING MODE ==="
                                     return 0
@@ -617,18 +630,18 @@ monitoring_loop() {
         sleep 1800  # 30 minutes = 1800 seconds
         
         log "info" "HEARTBEAT: Performing connectivity check #$heartbeat_count"
-        log "info" "HEARTBEAT: Pinging Google.com..."
+        log "info" "HEARTBEAT: Pinging Google.com via WiFi interface $interface..."
         
         local ping_result
-        ping_result=$(ping -c 1 -W 5 google.com 2>&1)
+        ping_result=$(ping -I "$interface" -c 1 -W 5 google.com 2>&1)
         if [ $? -eq 0 ]; then
-            log "info" "HEARTBEAT SUCCESS: Google.com ping successful"
+            log "info" "HEARTBEAT SUCCESS: Google.com ping successful via WiFi interface $interface"
             log "info" "HEARTBEAT: Connection is healthy, continuing monitoring"
         else
-            log "warn" "HEARTBEAT FAILURE: Google.com ping failed - $ping_result"
+            log "warn" "HEARTBEAT FAILURE: Google.com ping failed via WiFi interface $interface - $ping_result"
             log "warn" "HEARTBEAT: Performing secondary neverssl test..."
             
-            if ! verify_internet; then
+            if ! verify_internet "$interface"; then
                 log "error" "CONNECTIVITY LOST: Both ping and neverssl tests failed"
                 current_ssid=$(iwgetid -r "$interface" 2>/dev/null || echo "")
                 
@@ -653,7 +666,7 @@ monitoring_loop() {
                             
                             if spoof_mac "$interface" "$mac"; then
                                 if connect_to_network "$interface" "$current_ssid"; then
-                                    if verify_internet; then
+                                    if verify_internet "$interface"; then
                                         log "info" "RECOVERY SUCCESS: Connection restored with MAC $mac on '$current_ssid'"
                                         ((heartbeat_count++))
                                         continue 2  # Continue outer monitoring loop
@@ -704,10 +717,11 @@ main() {
     sleep "$INITIAL_WAIT"
     
     # Check if already connected to internet
-    log "info" "STARTUP: Checking if already connected to internet..."
-    if check_internet; then
-        log "info" "STARTUP: Already connected to internet, finding interface for monitoring..."
-        interface=$(find_wifi_interface)
+    log "info" "STARTUP: Finding WiFi interface for connectivity check..."
+    interface=$(find_wifi_interface)
+    log "info" "STARTUP: Checking if already connected to internet via interface $interface..."
+    if check_internet "$interface"; then
+        log "info" "STARTUP: Already connected to internet via interface $interface"
         log "info" "STARTUP: Using interface $interface for monitoring"
         monitoring_loop "$interface"
         exit 0
