@@ -260,7 +260,7 @@ find_wifi_interface() {
         # Method 1: Use ip command to find wireless interfaces
         while IFS= read -r iface; do
             [ -n "$iface" ] && interfaces+=("$iface")
-        done < <(ip -o link show | awk -F': ' '$2 ~ /^(wl|wlan)/ {print $2}' 2>/dev/null)
+        done < <(ip -o link show | awk -F': ' '$2 ~ /^(wl|wlan|ath|ra|eth.*wlan)/ {print $2}' 2>/dev/null)
         
         # Method 2: Fallback to iw if ip command fails
         if [ ${#interfaces[@]} -eq 0 ]; then
