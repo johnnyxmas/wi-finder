@@ -102,7 +102,18 @@ install_dependencies() {
     NETWORK_SERVICE=$(detect_network_service)
     DHCP_CLIENT=$(detect_dhcp_client)
     
-    local pkgs=("iw" "wireless-tools" "$NETWORK_SERVICE" "$DHCP_CLIENT" "iputils-ping" "curl" "arp-scan" "macchanger" "aircrack-ng")
+    # Define packages to install (excluding systemd services)
+    local base_pkgs=("iw" "wireless-tools" "iputils-ping" "curl" "arp-scan" "macchanger" "aircrack-ng")
+    local pkgs=("${base_pkgs[@]}")
+    
+    # Add network manager package if using NetworkManager
+    if [ "$NETWORK_SERVICE" = "network-manager" ]; then
+        pkgs+=("network-manager")
+    fi
+    
+    # Add DHCP client package
+    pkgs+=("$DHCP_CLIENT")
+    
     local missing=()
     
     log "info" "Checking for required packages..."
@@ -114,6 +125,15 @@ install_dependencies() {
             log "debug" "Found package: $pkg"
         fi
     done
+    
+    # Check for systemd-networkd service availability (not a package)
+    if [ "$NETWORK_SERVICE" = "systemd-networkd" ]; then
+        if systemctl list-unit-files systemd-networkd.service >/dev/null 2>&1; then
+            log "debug" "Found systemd service: systemd-networkd"
+        else
+            log "warn" "systemd-networkd service not available on this system"
+        fi
+    fi
 
     if [ ${#missing[@]} -ne 0 ]; then
         log "info" "DEPENDENCY INSTALL: Installing ${#missing[@]} missing packages: ${missing[*]}"
