@@ -121,9 +121,10 @@ install_dependencies() {
 
 check_internet() {
     if verify_internet; then
-        log "info" "Already connected to internet, exiting"
-        exit 0
+        log "info" "Already connected to internet, starting monitoring mode"
+        return 0
     fi
+    return 1
 }
 
 create_systemd_service() {
@@ -328,24 +329,14 @@ cleanup() {
     exit 0
 }
 
-main() {
-    # Setup traps for clean exit
-    trap 'cleanup "$interface"' EXIT
-    trap 'log "warn" "Received interrupt, cleaning up..."; cleanup "$interface"' INT TERM
-    if [ ! -f "/etc/systemd/system/wifi-autoconnect.service" ]; then
-        setup
-    fi
-        
-    log "debug" "Waiting $INITIAL_WAIT seconds for any predefined network connections..."
-    sleep "$INITIAL_WAIT"
+scan_and_connect() {
+    local interface=$1
     
-    interface=$(find_wifi_interface)
-
     log "info" "Scanning for open networks..."
     networks=($(scan_open_networks "$interface"))
     if [ ${#networks[@]} -eq 0 ]; then
         log "warn" "No open networks found"
-        exit 1
+        return 1
     fi
 
     for network in "${networks[@]}"; do
@@ -353,7 +344,7 @@ main() {
         if connect_to_network "$interface" "$network"; then
             if verify_internet; then
                 log "info" "Successfully connected to $network with internet access"
-                exit 0
+                return 0
             else
                 log "warn" "No internet access on $network, trying MAC spoofing..."
                 # Get unique MAC addresses and validate format
@@ -377,7 +368,7 @@ main() {
                     if connect_to_network "$interface" "$network"; then
                         if verify_internet; then
                             log "info" "Successfully bypassed captive portal with MAC $mac"
-                            exit 0
+                            return 0
                         fi
                     fi
                     cleanup_interface "$interface"
@@ -389,8 +380,65 @@ main() {
     done
     
     log "error" "Failed to connect to any network with internet access"
-    exit 1
+    return 1
+}
+
+monitoring_loop() {
+    local interface=$1
     
+    while true; do
+        log "info" "Monitoring connection... checking in 30 minutes"
+        sleep 1800  # 30 minutes = 1800 seconds
+        
+        log "info" "Checking internet connectivity..."
+        if ! verify_internet; then
+            log "warn" "Internet connectivity lost, restarting scan and connect process"
+            cleanup_interface "$interface"
+            
+            # Re-detect interface in case it changed
+            interface=$(find_wifi_interface)
+            
+            # Attempt to reconnect
+            if scan_and_connect "$interface"; then
+                log "info" "Successfully reconnected to internet"
+            else
+                log "error" "Failed to reconnect, will retry in 30 minutes"
+            fi
+        else
+            log "info" "Internet connectivity confirmed, continuing monitoring"
+        fi
+    done
+}
+
+main() {
+    # Setup traps for clean exit
+    trap 'cleanup "$interface"' EXIT
+    trap 'log "warn" "Received interrupt, cleaning up..."; cleanup "$interface"' INT TERM
+    if [ ! -f "/etc/systemd/system/wifi-autoconnect.service" ]; then
+        setup
+    fi
+        
+    log "debug" "Waiting $INITIAL_WAIT seconds for any predefined network connections..."
+    sleep "$INITIAL_WAIT"
+    
+    # Check if already connected to internet
+    if check_internet; then
+        interface=$(find_wifi_interface)
+        log "info" "Already connected to internet, entering monitoring mode"
+        monitoring_loop "$interface"
+        exit 0
+    fi
+    
+    interface=$(find_wifi_interface)
+
+    # Attempt initial connection
+    if scan_and_connect "$interface"; then
+        log "info" "Initial connection successful, entering monitoring mode"
+        monitoring_loop "$interface"
+    else
+        log "error" "Initial connection failed, exiting"
+        exit 1
+    fi
 }
 
 main "$@"
