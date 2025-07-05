@@ -60,10 +60,25 @@ log() {
     if [ "$level_num" -le "$LOG_LEVEL" ]; then
         local log_message="[$timestamp] [$level] $message"
         
+        # Check if this is an important informational message (contains SSIDs, MACs, network info)
+        local is_important=0
+        if [ "$level" = "info" ] && echo "$message" | grep -qE "(SUCCESS|FAILURE|ATTEMPT|Connected to|Bypassed|MAC|SSID|network|Found.*open|Discovered.*MAC)" ; then
+            is_important=1
+        fi
+        
         # Check if running under systemd (which handles log redirection)
         if [ -n "${SYSTEMD_EXEC_PID:-}" ] || [ -n "${INVOCATION_ID:-}" ]; then
-            # Running under systemd - just echo to stdout, systemd will handle logging
-            echo "$log_message"
+            # Running under systemd
+            if [ $is_important -eq 1 ]; then
+                # Important messages: ensure they go to both stdout and log file
+                if [ $((RANDOM % 100)) -eq 0 ]; then
+                    rotate_logs
+                fi
+                echo "$log_message" | tee -a "$LOG_FILE"
+            else
+                # Regular messages: just echo to stdout, systemd will handle logging
+                echo "$log_message"
+            fi
         else
             # Running standalone - handle our own logging
             # Only rotate logs occasionally to avoid overhead
@@ -350,7 +365,10 @@ scan_open_networks() {
     fi
     
     # Bring interface down first to reset state
-    ifconfig "$interface" down >/dev/null 2>&1
+    log "debug" "Bringing interface $interface down"
+    if ! ifconfig "$interface" down 2>&1; then
+        log "warn" "Failed to bring interface $interface down, continuing anyway"
+    fi
     sleep 1
     
     # Check and set interface mode to managed
@@ -360,34 +378,50 @@ scan_open_networks() {
     
     if [ "$current_mode" != "managed" ]; then
         log "info" "Setting interface $interface to managed mode"
-        if ! iw dev "$interface" set type managed >/dev/null 2>&1; then
-            log "error" "Failed to set interface to managed mode"
+        local mode_result
+        if ! mode_result=$(iw dev "$interface" set type managed 2>&1); then
+            log "error" "Failed to set interface to managed mode: $mode_result"
             return 1
         fi
+        log "debug" "Successfully set interface to managed mode"
     fi
     
     # Bring interface up
-    if ! ifconfig "$interface" up >/dev/null 2>&1; then
-        log "error" "Failed to bring interface $interface up"
+    log "debug" "Bringing interface $interface up"
+    local up_result
+    if ! up_result=$(ifconfig "$interface" up 2>&1); then
+        log "error" "Failed to bring interface $interface up: $up_result"
         return 1
     fi
+    log "debug" "Successfully brought interface $interface up"
     
     # Wait for interface to be ready
-    sleep 2
+    sleep 3
     
-    # Check interface state
+    # Verify interface is actually up
     local interface_state
     interface_state=$(ip link show "$interface" | grep -o "state [A-Z]*" | awk '{print $2}')
-    log "debug" "Interface state: $interface_state"
+    log "debug" "Interface state after bringing up: $interface_state"
+    
+    if [ "$interface_state" != "UP" ] && [ "$interface_state" != "UNKNOWN" ]; then
+        log "error" "Interface $interface is not in UP state (current: $interface_state)"
+        return 1
+    fi
     
     log "info" "Starting WiFi scan on interface $interface"
     
     # Perform scan with timeout and proper error handling
     local scan_result
-    if ! scan_result=$(timeout 15 iw dev "$interface" scan 2>/dev/null); then
+    if ! scan_result=$(timeout 15 iw dev "$interface" scan 2>&1); then
         log "error" "WiFi scan failed or timed out on interface $interface"
+        # Try to get more specific error information
+        local scan_error
+        scan_error=$(iw dev "$interface" scan 2>&1 || true)
+        log "error" "Scan error details: $scan_error"
         return 1
     fi
+    
+    log "debug" "Scan completed successfully, processing results"
     
     # Check if scan result contains actual BSS entries
     if ! echo "$scan_result" | grep -q "^BSS"; then
