@@ -14,12 +14,12 @@ LOG_FILE="/var/log/wi-finder.log"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 # Set defaults
-: ${RETRY_DELAY:=10}
-: ${INITIAL_WAIT:=30}
-: ${DNS_SERVERS:="1.1.1.1 8.8.8.8 9.9.9.9"}
-: ${LOG_LEVEL:=2} # 0=error, 1=warn, 2=info, 3=debug
-: ${LOG_MAX_SIZE:=1048576} # 1MB
-: ${LOG_BACKUP_COUNT:=3}
+: "${RETRY_DELAY:=10}"
+: "${INITIAL_WAIT:=30}"
+: "${DNS_SERVERS:=1.1.1.1 8.8.8.8 9.9.9.9}"
+: "${LOG_LEVEL:=2}" # 0=error, 1=warn, 2=info, 3=debug
+: "${LOG_MAX_SIZE:=1048576}" # 1MB
+: "${LOG_BACKUP_COUNT:=3}"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root" >&2
@@ -30,9 +30,10 @@ fi
 # Setup log rotation
 rotate_logs() {
     if [ -f "$LOG_FILE" ]; then
-        local size=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE")
+        local size
+        size=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE")
         if [ "$size" -gt "$LOG_MAX_SIZE" ]; then
-            for i in $(seq $LOG_BACKUP_COUNT -1 1); do
+            for i in $(seq "$LOG_BACKUP_COUNT" -1 1); do
                 [ -f "${LOG_FILE}.$i" ] && mv "${LOG_FILE}.$i" "${LOG_FILE}.$((i+1))"
             done
             mv "$LOG_FILE" "${LOG_FILE}.1"
@@ -43,7 +44,8 @@ rotate_logs() {
 log() {
     local level=$1
     local message=$2
-    local timestamp=$(date +"%Y-%m-%d %T")
+    local timestamp
+    timestamp=$(date +"%Y-%m-%d %T")
     
     # Map level names to numbers
     case $level in
@@ -55,8 +57,11 @@ log() {
     esac
     
     # Only log if level is <= configured LOG_LEVEL
-    if [ $level_num -le $LOG_LEVEL ]; then
-        rotate_logs
+    if [ "$level_num" -le "$LOG_LEVEL" ]; then
+        # Only rotate logs occasionally to avoid overhead
+        if [ $((RANDOM % 100)) -eq 0 ]; then
+            rotate_logs
+        fi
         echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
     fi
 }
@@ -102,6 +107,10 @@ detect_dhcp_client() {
     fi
 }
 
+# Global variables for detected services
+NETWORK_SERVICE=""
+DHCP_CLIENT=""
+
 get_dhcp_package() {
     # Always return dhcpcd-base as the package to install
     echo "dhcpcd-base"
@@ -112,6 +121,9 @@ install_dependencies() {
     NETWORK_SERVICE=$(detect_network_service)
     DHCP_CLIENT=$(detect_dhcp_client)
     DHCP_PACKAGE=$(get_dhcp_package)
+    
+    # Export for use in other functions
+    export NETWORK_SERVICE DHCP_CLIENT
     
     # Define packages to install (never install NetworkManager)
     local base_pkgs=("iw" "wireless-tools" "iputils-ping" "curl" "arp-scan" "macchanger" "aircrack-ng")
@@ -169,7 +181,8 @@ check_internet() {
 }
 
 create_systemd_service() {
-    local script_path=$(realpath "$0")
+    local script_path
+    script_path=$(realpath "$0")
     local service_file="/etc/systemd/system/wi-finder.service"
     
     cat > "$service_file" <<EOF
@@ -236,36 +249,52 @@ if [ ! -f "/etc/systemd/system/wi-finder.service" ] && [ -z "${SYSTEMD_EXEC_PID:
     exit 0
 fi
 
+# Initialize global variables early
+NETWORK_SERVICE=$(detect_network_service)
+DHCP_CLIENT=$(detect_dhcp_client)
+export NETWORK_SERVICE DHCP_CLIENT
+
 find_wifi_interface() {
-    # Get list of wireless interfaces using ip command
-    local interfaces=($(ip -o link show | awk -F': ' '$2 ~ /^wl/ {print $2}'))
+    local max_retries=5
+    local retry_count=0
     
-    # Fallback to iw if ip command fails
-    if [ ${#interfaces[@]} -eq 0 ]; then
-        interfaces=($(iw dev | awk '/Interface/ {print $2}'))
-    fi
-    
-    # Check each interface for association state
-    for interface in "${interfaces[@]}"; do
-        local state=$(iw dev "$interface" link 2>/dev/null | grep -q "Connected to" && echo "connected" || echo "disconnected")
+    while [ $retry_count -lt $max_retries ]; do
+        # Get list of wireless interfaces using ip command
+        local interfaces=($(ip -o link show | awk -F': ' '$2 ~ /^wl/ {print $2}'))
         
-        if [ "$state" = "disconnected" ]; then
-            WIFI_INTERFACE="$interface"
-            log "debug" "Found available interface: $interface"
-            return 0
+        # Fallback to iw if ip command fails
+        if [ ${#interfaces[@]} -eq 0 ]; then
+            interfaces=($(iw dev | awk '/Interface/ {print $2}'))
         fi
+        
+        # Check each interface for association state
+        for interface in "${interfaces[@]}"; do
+            local state=$(iw dev "$interface" link 2>/dev/null | grep -q "Connected to" && echo "connected" || echo "disconnected")
+            
+            if [ "$state" = "disconnected" ]; then
+                log "debug" "Found available interface: $interface"
+                echo "$interface"  # Return the interface name
+                return 0
+            fi
+        done
+        
+        if [ ${#interfaces[@]} -eq 0 ]; then
+            log "error" "No WiFi interfaces detected (attempt $((retry_count + 1))/$max_retries)"
+        else
+            log "warn" "All WiFi interfaces are already connected (attempt $((retry_count + 1))/$max_retries)"
+        fi
+        
+        # Wait and retry if no available interface found
+        if [ $retry_count -lt $((max_retries - 1)) ]; then
+            log "info" "Waiting $RETRY_DELAY seconds before retrying..."
+            sleep "$RETRY_DELAY"
+        fi
+        
+        ((retry_count++))
     done
     
-    if [ ${#interfaces[@]} -eq 0 ]; then
-        log "error" "No WiFi interfaces detected"
-    else
-        log "warn" "All WiFi interfaces are already connected"
-    fi
-    
-    # Wait and retry if no available interface found
-    log "info" "Waiting $RETRY_DELAY seconds before retrying..."
-    sleep "$RETRY_DELAY"
-    find_wifi_interface
+    log "error" "Failed to find available WiFi interface after $max_retries attempts"
+    return 1
 }
 
 scan_open_networks() {
@@ -274,8 +303,7 @@ scan_open_networks() {
     
     # Scan and sort by signal strength (strongest first)
     local scan_result
-    scan_result=$(iw dev "$interface" scan 2>&1)
-    if [ $? -ne 0 ]; then
+    if ! scan_result=$(iw dev "$interface" scan 2>&1); then
         log "error" "WiFi scan failed: $scan_result"
         return 1
     fi
@@ -283,11 +311,19 @@ scan_open_networks() {
     local networks
     networks=$(echo "$scan_result" | \
         awk '
-        /^BSS/ { bss = $2 }
+        BEGIN { ssid = ""; signal = ""; privacy = 0 }
+        /^BSS/ {
+            # Process previous entry if complete
+            if (ssid && !privacy && signal) {
+                print signal " " ssid
+            }
+            # Reset for new BSS
+            ssid = ""; signal = ""; privacy = 0
+        }
         /SSID:/ {
             gsub(/.*SSID: /, "");
             gsub(/\t/, "");
-            if ($0 != "") ssid = $0
+            if ($0 != "" && $0 != "\\x00") ssid = $0
         }
         /signal:/ {
             gsub(/.*signal: /, "");
@@ -295,16 +331,19 @@ scan_open_networks() {
             signal = $0
         }
         /capability:.*Privacy/ { privacy = 1 }
-        /capability:/ && !/Privacy/ {
+        END {
+            # Process final entry
             if (ssid && !privacy && signal) {
                 print signal " " ssid
             }
-            ssid = ""; signal = ""; privacy = 0
         }' | \
         sort -nr | \
         awk '{$1=""; print substr($0,2)}')
     
+    # Filter out empty lines and count
+    networks=$(echo "$networks" | grep -v '^[[:space:]]*$')
     local network_count=$(echo "$networks" | wc -l)
+    
     if [ -n "$networks" ] && [ "$network_count" -gt 0 ]; then
         log "info" "Found $network_count open networks:"
         echo "$networks" | while read -r network; do
@@ -312,6 +351,7 @@ scan_open_networks() {
         done
     else
         log "warn" "No open networks found in scan"
+        networks=""  # Ensure empty if no valid networks
     fi
     
     echo "$networks"
@@ -345,8 +385,19 @@ connect_to_network() {
     fi
     
     log "info" "Association successful, requesting DHCP lease for $ssid"
-    if ! $DHCP_CLIENT "$interface" 2>&1; then
-        log "error" "FAILURE: Failed to get DHCP lease for network '$ssid'"
+    local dhcp_result
+    if [ "$DHCP_CLIENT" = "dhclient" ]; then
+        if ! dhcp_result=$(dhclient "$interface" 2>&1); then
+            log "error" "FAILURE: Failed to get DHCP lease for network '$ssid': $dhcp_result"
+            return 1
+        fi
+    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
+        if ! dhcp_result=$(dhcpcd "$interface" 2>&1); then
+            log "error" "FAILURE: Failed to get DHCP lease for network '$ssid': $dhcp_result"
+            return 1
+        fi
+    else
+        log "error" "FAILURE: Unknown DHCP client: $DHCP_CLIENT"
         return 1
     fi
     
@@ -359,7 +410,8 @@ check_captive_portal() {
     log "info" "ATTEMPT: Testing for captive portal using neverssl.com via interface $interface"
     
     # Get the IP address of the WiFi interface
-    local wifi_ip=$(ip addr show "$interface" | grep -oP 'inet \K[\d.]+' | head -1)
+    local wifi_ip
+    wifi_ip=$(ip addr show "$interface" | grep -oP 'inet \K[\d.]+' | head -1)
     if [ -z "$wifi_ip" ]; then
         log "error" "FAILURE: No IP address found on WiFi interface $interface"
         return 1
@@ -385,6 +437,12 @@ check_captive_portal() {
     fi
 }
 
+# Helper function to validate MAC address format
+is_valid_mac() {
+    local mac=$1
+    [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
 get_mac_addresses() {
     local interface=$1
     local macs=()
@@ -395,11 +453,10 @@ get_mac_addresses() {
     if command -v arp-scan >/dev/null 2>&1; then
         log "debug" "Using arp-scan to discover MAC addresses"
         local arp_result
-        arp_result=$(arp-scan --interface="$interface" --localnet 2>&1)
-        if [ $? -eq 0 ]; then
+        if arp_result=$(arp-scan --interface="$interface" --localnet 2>&1); then
             while IFS= read -r line; do
                 local mac=$(echo "$line" | awk '{print $2}')
-                if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                if is_valid_mac "$mac"; then
                     macs+=("$mac")
                     log "debug" "Found MAC address via arp-scan: $mac"
                 fi
@@ -414,19 +471,33 @@ get_mac_addresses() {
     # Fall back to airodump-ng if no results
     if [ ${#macs[@]} -eq 0 ] && command -v airodump-ng >/dev/null 2>&1; then
         log "debug" "Falling back to airodump-ng for MAC discovery"
-        local airodump_result
-        airodump_result=$(timeout 10 airodump-ng "$interface" 2>&1 | head -20)
-        if [ $? -eq 0 ]; then
-            while IFS= read -r line; do
-                local mac=$(echo "$line" | awk '{print $1}')
-                if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && [[ "$line" != *"BSSID"* ]]; then
+        local temp_file=$(mktemp)
+        
+        # Run airodump-ng in background and capture output
+        timeout 10 airodump-ng "$interface" --write-interval 1 -w "$temp_file" >/dev/null 2>&1 &
+        local airodump_pid=$!
+        sleep 5
+        kill $airodump_pid 2>/dev/null
+        wait $airodump_pid 2>/dev/null
+        
+        # Parse the CSV file if it exists
+        if [ -f "${temp_file}-01.csv" ]; then
+            while IFS=',' read -r mac signal _ _ _ _ _ _ _ _ _ _ _ _; do
+                # Skip header and empty lines
+                [[ "$mac" =~ ^[[:space:]]*$ ]] && continue
+                [[ "$mac" == "BSSID" ]] && continue
+                
+                # Clean up MAC address
+                mac=$(echo "$mac" | tr -d ' ')
+                if is_valid_mac "$mac"; then
                     macs+=("$mac")
                     log "debug" "Found MAC address via airodump-ng: $mac"
                 fi
-            done < <(echo "$airodump_result" | grep -E '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
-        else
-            log "warn" "airodump-ng failed or timed out"
+            done < "${temp_file}-01.csv"
         fi
+        
+        # Cleanup temp files
+        rm -f "${temp_file}"* 2>/dev/null
     elif [ ${#macs[@]} -eq 0 ]; then
         log "debug" "airodump-ng not available"
     fi
@@ -447,7 +518,8 @@ spoof_mac() {
     log "info" "ATTEMPT: Spoofing MAC address to $mac on interface $interface"
     
     # Get current MAC for comparison
-    local current_mac=$(ip link show "$interface" | grep -o -E '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)
+    local current_mac
+    current_mac=$(ip link show "$interface" | grep -o -E '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)
     log "debug" "Current MAC address: $current_mac"
     
     # Bring interface down first
@@ -459,16 +531,14 @@ spoof_mac() {
     local spoof_result
     if command -v macchanger >/dev/null 2>&1; then
         log "debug" "Using macchanger for MAC spoofing"
-        spoof_result=$(macchanger -m "$mac" "$interface" 2>&1)
-        if [ $? -ne 0 ]; then
+        if ! spoof_result=$(macchanger -m "$mac" "$interface" 2>&1); then
             log "error" "FAILURE: macchanger failed: $spoof_result"
             ip link set dev "$interface" up
             return 1
         fi
     else
         log "debug" "Using ip command for MAC spoofing"
-        spoof_result=$(ip link set dev "$interface" address "$mac" 2>&1)
-        if [ $? -ne 0 ]; then
+        if ! spoof_result=$(ip link set dev "$interface" address "$mac" 2>&1); then
             log "error" "FAILURE: ip command MAC spoofing failed: $spoof_result"
             ip link set dev "$interface" up
             return 1
@@ -484,7 +554,8 @@ spoof_mac() {
     sleep 2  # Give interface time to come up
     
     # Verify MAC change
-    local new_mac=$(ip link show "$interface" | grep -o -E '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)
+    local new_mac
+    new_mac=$(ip link show "$interface" | grep -o -E '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1)
     if [ "$new_mac" = "$mac" ]; then
         log "info" "SUCCESS: MAC address successfully changed from $current_mac to $new_mac"
         return 0
@@ -509,7 +580,14 @@ verify_internet() {
 cleanup_interface() {
     local interface=$1
     log "debug" "Cleaning up interface $interface"
-    dhclient -r "$interface" >/dev/null 2>&1
+    
+    # Use detected DHCP client for cleanup
+    if [ "$DHCP_CLIENT" = "dhclient" ]; then
+        dhclient -r "$interface" >/dev/null 2>&1
+    elif [ "$DHCP_CLIENT" = "dhcpcd" ]; then
+        dhcpcd -k "$interface" >/dev/null 2>&1
+    fi
+    
     ifconfig "$interface" down >/dev/null 2>&1
 }
 
@@ -529,7 +607,15 @@ scan_and_connect() {
         log "info" "=== SCAN ATTEMPT #$scan_attempt ==="
         log "info" "Scanning for open networks on interface $interface..."
         
-        networks=($(scan_open_networks "$interface"))
+        local networks_output
+        networks_output=$(scan_open_networks "$interface")
+        
+        # Convert to array, filtering empty lines
+        local networks=()
+        while IFS= read -r line; do
+            [ -n "$line" ] && networks+=("$line")
+        done <<< "$networks_output"
+        
         if [ ${#networks[@]} -eq 0 ]; then
             log "warn" "SCAN RESULT: No open networks found in attempt #$scan_attempt"
             log "info" "Waiting 60 seconds before next scan attempt..."
@@ -561,7 +647,7 @@ scan_and_connect() {
                     # Get unique MAC addresses and validate format
                     declare -A unique_macs
                     for mac in $(get_mac_addresses "$interface"); do
-                        if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                        if is_valid_mac "$mac"; then
                             unique_macs["$mac"]=1
                         fi
                     done
@@ -633,8 +719,7 @@ monitoring_loop() {
         log "info" "HEARTBEAT: Pinging Google.com via WiFi interface $interface..."
         
         local ping_result
-        ping_result=$(ping -I "$interface" -c 1 -W 5 google.com 2>&1)
-        if [ $? -eq 0 ]; then
+        if ping_result=$(ping -I "$interface" -c 1 -W 5 google.com 2>&1); then
             log "info" "HEARTBEAT SUCCESS: Google.com ping successful via WiFi interface $interface"
             log "info" "HEARTBEAT: Connection is healthy, continuing monitoring"
         else
@@ -643,7 +728,14 @@ monitoring_loop() {
             
             if ! verify_internet "$interface"; then
                 log "error" "CONNECTIVITY LOST: Both ping and neverssl tests failed"
-                current_ssid=$(iwgetid -r "$interface" 2>/dev/null || echo "")
+                # Try multiple methods to get current SSID
+                current_ssid=""
+                if command -v iwgetid >/dev/null 2>&1; then
+                    current_ssid=$(iwgetid -r "$interface" 2>/dev/null || echo "")
+                fi
+                if [ -z "$current_ssid" ] && command -v iw >/dev/null 2>&1; then
+                    current_ssid=$(iw dev "$interface" link 2>/dev/null | grep "SSID:" | awk '{print $2}' || echo "")
+                fi
                 
                 if [ -n "$current_ssid" ]; then
                     log "info" "RECOVERY ATTEMPT: Trying MAC spoofing on current network '$current_ssid'"
@@ -651,7 +743,7 @@ monitoring_loop() {
                     # Get unique MAC addresses and validate format
                     declare -A unique_macs
                     for mac in $(get_mac_addresses "$interface"); do
-                        if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                        if is_valid_mac "$mac"; then
                             unique_macs["$mac"]=1
                         fi
                     done
@@ -689,7 +781,13 @@ monitoring_loop() {
                 cleanup_interface "$interface"
                 
                 # Re-detect interface in case it changed
-                interface=$(find_wifi_interface)
+                local new_interface
+                if new_interface=$(find_wifi_interface) && [ -n "$new_interface" ]; then
+                    interface="$new_interface"
+                else
+                    log "error" "Failed to find WiFi interface for recovery"
+                    return 1
+                fi
                 
                 # Attempt to reconnect
                 if scan_and_connect "$interface"; then
@@ -718,7 +816,11 @@ main() {
     
     # Check if already connected to internet
     log "info" "STARTUP: Finding WiFi interface for connectivity check..."
-    interface=$(find_wifi_interface)
+    if ! interface=$(find_wifi_interface) || [ -z "$interface" ]; then
+        log "error" "STARTUP: Failed to find WiFi interface"
+        exit 1
+    fi
+    
     log "info" "STARTUP: Checking if already connected to internet via interface $interface..."
     if check_internet "$interface"; then
         log "info" "STARTUP: Already connected to internet via interface $interface"
@@ -728,7 +830,10 @@ main() {
     fi
     
     log "info" "STARTUP: No internet connection detected, starting WiFi discovery process..."
-    interface=$(find_wifi_interface)
+    if ! interface=$(find_wifi_interface) || [ -z "$interface" ]; then
+        log "error" "STARTUP: Failed to find WiFi interface for connection attempts"
+        exit 1
+    fi
     log "info" "STARTUP: Using interface $interface for WiFi connection attempts"
 
     # Attempt initial connection
