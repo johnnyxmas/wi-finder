@@ -154,14 +154,40 @@ EOF
     log "info" "Created systemd service at $service_file"
 }
 
-setup() {
-    log "info" "Setting up WiFi Autoconnect script..."
-    check_internet
-    install_dependencies
+start_service() {
+    log "info" "Starting wi-finder service..."
+    if systemctl start wi-finder; then
+        log "info" "wi-finder service started successfully"
+        if systemctl is-active --quiet wi-finder; then
+            log "info" "Service is running"
+        else
+            log "error" "Service failed to start properly"
+            exit 1
+        fi
+    else
+        log "error" "Failed to start wi-finder service"
+        exit 1
+    fi
 }
 
-install_dependencies
-create_systemd_service
+setup() {
+    log "info" "Setting up WiFi Autoconnect script..."
+    install_dependencies
+    create_systemd_service
+    start_service
+}
+
+# Check if running as service setup or main execution
+if [ "${1:-}" = "--setup" ]; then
+    setup
+    exit 0
+fi
+
+# If service doesn't exist, set it up first
+if [ ! -f "/etc/systemd/system/wi-finder.service" ]; then
+    setup
+    exit 0
+fi
 
 find_wifi_interface() {
     # Get list of wireless interfaces using ip command
@@ -197,9 +223,29 @@ find_wifi_interface() {
 
 scan_open_networks() {
     local interface=$1
+    # Scan and sort by signal strength (strongest first)
     iw dev "$interface" scan | \
-        awk -F ':' '/SSID/ {gsub(/"/,"",$2); print $2}' | \
-        sort | uniq
+        awk '
+        /^BSS/ { bss = $2 }
+        /SSID:/ {
+            gsub(/.*SSID: /, "");
+            gsub(/\t/, "");
+            if ($0 != "") ssid = $0
+        }
+        /signal:/ {
+            gsub(/.*signal: /, "");
+            gsub(/ dBm.*/, "");
+            signal = $0
+        }
+        /capability:.*Privacy/ { privacy = 1 }
+        /capability:/ && !/Privacy/ {
+            if (ssid && !privacy && signal) {
+                print signal " " ssid
+            }
+            ssid = ""; signal = ""; privacy = 0
+        }' | \
+        sort -nr | \
+        awk '{$1=""; print substr($0,2)}'
 }
 
 connect_to_network() {
@@ -239,10 +285,10 @@ connect_to_network() {
 check_captive_portal() {
     local response
     response=$(curl -s --max-time 5 http://neverssl.com || true)
-    if ! echo "$response" | grep -q "This website is for when you try to open Facebook"; then
-        return 0  # Captive portal detected
+    if echo "$response" | grep -q "This website is for when you try to open Facebook"; then
+        return 0  # No captive portal - test succeeded
     fi
-    return 1  # No captive portal
+    return 1  # Captive portal detected - test failed
 }
 
 get_mac_addresses() {
@@ -270,46 +316,29 @@ spoof_mac() {
     local interface=$1
     local mac=$2
     
+    log "debug" "Spoofing MAC address to $mac on interface $interface"
+    
+    # Bring interface down first
+    ip link set dev "$interface" down
+    
     if command -v macchanger >/dev/null 2>&1; then
         macchanger -m "$mac" "$interface"
     else
-        ip link set dev "$interface" down
         ip link set dev "$interface" address "$mac"
-        ip link set dev "$interface" up
     fi
+    
+    # Bring interface back up
+    ip link set dev "$interface" up
+    sleep 2  # Give interface time to come up
 }
 
 verify_internet() {
-    if ping -c 1 -W 2 google.com >/dev/null 2>&1 || \
-       ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-        if check_captive_portal; then
-            log "warn" "Captive portal detected"
-            return 1
-        fi
+    # First do the neverssl test as specified in the flow
+    if check_captive_portal; then
+        log "info" "neverssl test succeeded - internet access confirmed"
         return 0
     else
-        # Check if it's a DNS resolution issue
-        if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-            return 1  # General connectivity issue
-        fi
-        
-        # Try with different DNS servers
-        for dns in $DNS_SERVERS; do
-            log "debug" "Trying DNS server: $dns"
-            echo "nameserver $dns" > /etc/resolv.conf
-            sleep 5
-            if ping -c 1 -W 2 google.com >/dev/null 2>&1; then
-                break
-            fi
-        done
-        
-        if ping -c 1 -W 2 google.com >/dev/null 2>&1; then
-            if check_captive_portal; then
-                echo "Captive portal detected"
-                return 1
-            fi
-            return 0
-        fi
+        log "warn" "neverssl test failed - captive portal detected or no internet"
         return 1
     fi
 }
@@ -332,55 +361,59 @@ cleanup() {
 scan_and_connect() {
     local interface=$1
     
-    log "info" "Scanning for open networks..."
-    networks=($(scan_open_networks "$interface"))
-    if [ ${#networks[@]} -eq 0 ]; then
-        log "warn" "No open networks found"
-        return 1
-    fi
-
-    for network in "${networks[@]}"; do
-        log "info" "Attempting to connect to: $network"
-        if connect_to_network "$interface" "$network"; then
-            if verify_internet; then
-                log "info" "Successfully connected to $network with internet access"
-                return 0
-            else
-                log "warn" "No internet access on $network, trying MAC spoofing..."
-                # Get unique MAC addresses and validate format
-                declare -A unique_macs
-                for mac in $(get_mac_addresses "$interface"); do
-                    if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-                        unique_macs["$mac"]=1
-                    fi
-                done
-                
-                if [ ${#unique_macs[@]} -eq 0 ]; then
-                    log "warn" "No valid MAC addresses found for spoofing"
-                    continue
-                fi
-                
-                macs=("${!unique_macs[@]}")
-                
-                for mac in "${macs[@]}"; do
-                    log "debug" "Trying MAC address: $mac"
-                    spoof_mac "$interface" "$mac"
-                    if connect_to_network "$interface" "$network"; then
-                        if verify_internet; then
-                            log "info" "Successfully bypassed captive portal with MAC $mac"
-                            return 0
-                        fi
-                    fi
-                    cleanup_interface "$interface"
-                done
-                log "error" "Failed to bypass captive portal with any MAC address"
-            fi
+    while true; do
+        log "info" "Scanning for open networks..."
+        networks=($(scan_open_networks "$interface"))
+        if [ ${#networks[@]} -eq 0 ]; then
+            log "warn" "No open networks found, waiting 60 seconds before scanning again..."
+            sleep 60
+            continue
         fi
-        cleanup_interface "$interface"
+
+        for network in "${networks[@]}"; do
+            log "info" "Attempting to connect to: $network"
+            if connect_to_network "$interface" "$network"; then
+                if verify_internet; then
+                    log "info" "Successfully connected to $network with internet access"
+                    return 0
+                else
+                    log "warn" "No internet access on $network, trying MAC spoofing..."
+                    # Get unique MAC addresses and validate format
+                    declare -A unique_macs
+                    for mac in $(get_mac_addresses "$interface"); do
+                        if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                            unique_macs["$mac"]=1
+                        fi
+                    done
+                    
+                    if [ ${#unique_macs[@]} -eq 0 ]; then
+                        log "warn" "No valid MAC addresses found for spoofing"
+                        cleanup_interface "$interface"
+                        continue
+                    fi
+                    
+                    macs=("${!unique_macs[@]}")
+                    
+                    for mac in "${macs[@]}"; do
+                        log "debug" "Trying MAC address: $mac"
+                        spoof_mac "$interface" "$mac"
+                        if connect_to_network "$interface" "$network"; then
+                            if verify_internet; then
+                                log "info" "Successfully bypassed captive portal with MAC $mac"
+                                return 0
+                            fi
+                        fi
+                        cleanup_interface "$interface"
+                    done
+                    log "error" "Failed to bypass captive portal with any MAC address"
+                fi
+            fi
+            cleanup_interface "$interface"
+        done
+        
+        log "warn" "Failed to connect to any network with internet access, waiting 60 seconds before scanning again..."
+        sleep 60
     done
-    
-    log "error" "Failed to connect to any network with internet access"
-    return 1
 }
 
 monitoring_loop() {
@@ -390,22 +423,56 @@ monitoring_loop() {
         log "info" "Monitoring connection... checking in 30 minutes"
         sleep 1800  # 30 minutes = 1800 seconds
         
-        log "info" "Checking internet connectivity..."
-        if ! verify_internet; then
-            log "warn" "Internet connectivity lost, restarting scan and connect process"
-            cleanup_interface "$interface"
-            
-            # Re-detect interface in case it changed
-            interface=$(find_wifi_interface)
-            
-            # Attempt to reconnect
-            if scan_and_connect "$interface"; then
-                log "info" "Successfully reconnected to internet"
-            else
-                log "error" "Failed to reconnect, will retry in 30 minutes"
+        log "info" "Pinging Google.com as heartbeat..."
+        if ! ping -c 1 -W 5 google.com >/dev/null 2>&1; then
+            log "warn" "Heartbeat ping to Google.com failed, retrying neverssl test"
+            if ! verify_internet; then
+                log "warn" "Internet connectivity lost, attempting MAC cloning and reconnection"
+                
+                # Try MAC spoofing first before full restart
+                current_ssid=$(iwgetid -r "$interface" 2>/dev/null || echo "")
+                if [ -n "$current_ssid" ]; then
+                    log "info" "Attempting MAC spoofing on current network: $current_ssid"
+                    
+                    # Get unique MAC addresses and validate format
+                    declare -A unique_macs
+                    for mac in $(get_mac_addresses "$interface"); do
+                        if [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                            unique_macs["$mac"]=1
+                        fi
+                    done
+                    
+                    if [ ${#unique_macs[@]} -gt 0 ]; then
+                        macs=("${!unique_macs[@]}")
+                        for mac in "${macs[@]}"; do
+                            log "debug" "Trying MAC address: $mac"
+                            spoof_mac "$interface" "$mac"
+                            if connect_to_network "$interface" "$current_ssid"; then
+                                if verify_internet; then
+                                    log "info" "Successfully restored connection with MAC $mac"
+                                    continue 2  # Continue outer monitoring loop
+                                fi
+                            fi
+                            cleanup_interface "$interface"
+                        done
+                    fi
+                fi
+                
+                log "warn" "MAC spoofing failed, restarting full scan and connect process"
+                cleanup_interface "$interface"
+                
+                # Re-detect interface in case it changed
+                interface=$(find_wifi_interface)
+                
+                # Attempt to reconnect
+                if scan_and_connect "$interface"; then
+                    log "info" "Successfully reconnected to internet"
+                else
+                    log "error" "Failed to reconnect, will retry in 30 minutes"
+                fi
             fi
         else
-            log "info" "Internet connectivity confirmed, continuing monitoring"
+            log "info" "Heartbeat ping successful, internet connectivity confirmed"
         fi
     done
 }
@@ -414,9 +481,6 @@ main() {
     # Setup traps for clean exit
     trap 'cleanup "$interface"' EXIT
     trap 'log "warn" "Received interrupt, cleaning up..."; cleanup "$interface"' INT TERM
-    if [ ! -f "/etc/systemd/system/wifi-autoconnect.service" ]; then
-        setup
-    fi
         
     log "debug" "Waiting $INITIAL_WAIT seconds for any predefined network connections..."
     sleep "$INITIAL_WAIT"
