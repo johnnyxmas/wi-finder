@@ -61,10 +61,13 @@ log() {
     fi
 }
 
-# Redirect all output to log function
-exec 3>&1 4>&2
-exec 1> >(while read -r line; do log "info" "$line"; done)
-exec 2> >(while read -r line; do log "error" "$line"; done)
+# Only redirect output if not running as systemd service
+if [ -z "${SYSTEMD_EXEC_PID:-}" ]; then
+    # Redirect all output to log function
+    exec 3>&1 4>&2
+    exec 1> >(while read -r line; do log "info" "$line"; done)
+    exec 2> >(while read -r line; do log "error" "$line"; done)
+fi
 
 log "info" "••¤(×[¤ wi-finder 1.1 by J0hnnyXm4s ¤]×)¤••"
 log "info" ""
@@ -192,6 +195,12 @@ EOF
 }
 
 start_service() {
+    # Check if service is already running
+    if systemctl is-active --quiet wi-finder; then
+        log "info" "wi-finder service is already running"
+        return 0
+    fi
+    
     log "info" "Starting wi-finder service..."
     if systemctl start wi-finder; then
         log "info" "wi-finder service started successfully"
@@ -220,8 +229,8 @@ if [ "${1:-}" = "--setup" ]; then
     exit 0
 fi
 
-# If service doesn't exist, set it up first
-if [ ! -f "/etc/systemd/system/wi-finder.service" ]; then
+# If service doesn't exist, set it up first (but not if running from systemd)
+if [ ! -f "/etc/systemd/system/wi-finder.service" ] && [ -z "${SYSTEMD_EXEC_PID:-}" ]; then
     setup
     exit 0
 fi
