@@ -90,25 +90,32 @@ detect_network_service() {
 detect_dhcp_client() {
     if command -v dhclient >/dev/null 2>&1; then
         echo "dhclient"
-    elif command -v dhcp-client >/dev/null 2>&1; then
-        echo "dhcp-client"
+    elif command -v dhcpcd >/dev/null 2>&1; then
+        echo "dhcpcd"
     else
-        echo "dhclient"
-        log "warn" "Neither dhclient nor dhcp-client found. Will attempt to use dhclient"
+        log "error" "No DHCP client found (dhclient or dhcpcd)"
+        log "error" "Please install dhcpcd-base package"
+        exit 1
     fi
+}
+
+get_dhcp_package() {
+    # Always return dhcpcd-base as the package to install
+    echo "dhcpcd-base"
 }
 
 install_dependencies() {
     log "info" "=== DEPENDENCY CHECK ==="
     NETWORK_SERVICE=$(detect_network_service)
     DHCP_CLIENT=$(detect_dhcp_client)
+    DHCP_PACKAGE=$(get_dhcp_package)
     
     # Define packages to install (never install NetworkManager)
     local base_pkgs=("iw" "wireless-tools" "iputils-ping" "curl" "arp-scan" "macchanger" "aircrack-ng")
     local pkgs=("${base_pkgs[@]}")
     
     # Add DHCP client package
-    pkgs+=("$DHCP_CLIENT")
+    pkgs+=("$DHCP_PACKAGE")
     
     # Verify NetworkManager is not in our install list
     if [ "$NETWORK_SERVICE" = "network-manager" ]; then
