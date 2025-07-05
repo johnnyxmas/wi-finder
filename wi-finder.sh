@@ -66,13 +66,8 @@ log() {
     fi
 }
 
-# Only redirect output if not running as systemd service
-if [ -z "${SYSTEMD_EXEC_PID:-}" ]; then
-    # Redirect all output to log function
-    exec 3>&1 4>&2
-    exec 1> >(while read -r line; do log "info" "$line"; done)
-    exec 2> >(while read -r line; do log "error" "$line"; done)
-fi
+# Disable output redirection to prevent log parsing issues
+# Only log explicitly through log function calls
 
 log "info" "••¤(×[¤ wi-finder 1.1 by J0hnnyXm4s ¤]×)¤••"
 log "info" ""
@@ -259,22 +254,55 @@ find_wifi_interface() {
     local retry_count=0
     
     while [ $retry_count -lt $max_retries ]; do
-        # Get list of wireless interfaces using ip command
-        local interfaces=($(ip -o link show | awk -F': ' '$2 ~ /^wl/ {print $2}'))
+        # Get list of wireless interfaces using multiple methods
+        local interfaces=()
         
-        # Fallback to iw if ip command fails
+        # Method 1: Use ip command to find wireless interfaces
+        while IFS= read -r iface; do
+            [ -n "$iface" ] && interfaces+=("$iface")
+        done < <(ip -o link show | awk -F': ' '$2 ~ /^(wl|wlan)/ {print $2}' 2>/dev/null)
+        
+        # Method 2: Fallback to iw if ip command fails
         if [ ${#interfaces[@]} -eq 0 ]; then
-            interfaces=($(iw dev | awk '/Interface/ {print $2}'))
+            while IFS= read -r iface; do
+                [ -n "$iface" ] && interfaces+=("$iface")
+            done < <(iw dev 2>/dev/null | awk '/Interface/ {print $2}')
         fi
         
-        # Check each interface for association state
+        # Method 3: Check /sys/class/net for wireless interfaces
+        if [ ${#interfaces[@]} -eq 0 ]; then
+            for iface in /sys/class/net/*/wireless; do
+                if [ -d "$iface" ]; then
+                    local ifname=$(basename "$(dirname "$iface")")
+                    interfaces+=("$ifname")
+                fi
+            done
+        fi
+        
+        log "debug" "Found ${#interfaces[@]} wireless interfaces: ${interfaces[*]}"
+        
+        # Check each interface for availability
         for interface in "${interfaces[@]}"; do
-            local state=$(iw dev "$interface" link 2>/dev/null | grep -q "Connected to" && echo "connected" || echo "disconnected")
+            # Skip if interface doesn't exist
+            if ! ip link show "$interface" >/dev/null 2>&1; then
+                log "debug" "Interface $interface does not exist, skipping"
+                continue
+            fi
+            
+            # Check if interface is up and not connected
+            local state
+            if iw dev "$interface" link 2>/dev/null | grep -q "Connected to"; then
+                state="connected"
+            else
+                state="disconnected"
+            fi
             
             if [ "$state" = "disconnected" ]; then
                 log "debug" "Found available interface: $interface"
                 echo "$interface"  # Return the interface name
                 return 0
+            else
+                log "debug" "Interface $interface is already connected"
             fi
         done
         
@@ -299,12 +327,25 @@ find_wifi_interface() {
 
 scan_open_networks() {
     local interface=$1
+    
+    # Validate interface parameter
+    if [ -z "$interface" ]; then
+        log "error" "No interface specified for WiFi scan"
+        return 1
+    fi
+    
+    # Validate interface exists
+    if ! ip link show "$interface" >/dev/null 2>&1; then
+        log "error" "Interface $interface does not exist"
+        return 1
+    fi
+    
     log "info" "Starting WiFi scan on interface $interface"
     
     # Scan and sort by signal strength (strongest first)
     local scan_result
     if ! scan_result=$(iw dev "$interface" scan 2>&1); then
-        log "error" "WiFi scan failed: $scan_result"
+        log "error" "WiFi scan failed on interface $interface: $scan_result"
         return 1
     fi
     
@@ -360,6 +401,23 @@ scan_open_networks() {
 connect_to_network() {
     local interface=$1
     local ssid=$2
+    
+    # Validate parameters
+    if [ -z "$interface" ]; then
+        log "error" "FAILURE: No interface specified for connection"
+        return 1
+    fi
+    
+    if [ -z "$ssid" ]; then
+        log "error" "FAILURE: No SSID specified for connection"
+        return 1
+    fi
+    
+    # Validate interface exists
+    if ! ip link show "$interface" >/dev/null 2>&1; then
+        log "error" "FAILURE: Interface $interface does not exist"
+        return 1
+    fi
     
     log "info" "ATTEMPT: Connecting to network '$ssid' on interface $interface"
     
