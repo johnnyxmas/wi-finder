@@ -331,52 +331,58 @@ scan_open_networks() {
     # Validate interface parameter
     if [ -z "$interface" ]; then
         log "error" "No interface specified for WiFi scan"
-        printf ""  # Return empty result to stdout
         return 1
     fi
     
     # Validate interface exists
     if ! ip link show "$interface" >/dev/null 2>&1; then
         log "error" "Interface $interface does not exist"
-        printf ""
         return 1
     fi
     
-    # Ensure interface is up first
-    if ! ip link set "$interface" up >/dev/null 2>&1; then
-        log "error" "Failed to bring interface $interface up"
-        printf ""
-        return 1
-    fi
+    # Bring interface down first to reset state
+    ifconfig "$interface" down >/dev/null 2>&1
+    sleep 1
     
-    # Check interface mode and set to managed if needed
+    # Check and set interface mode to managed
     local current_mode
     current_mode=$(iw dev "$interface" info 2>/dev/null | grep "type" | awk '{print $2}')
-    if [ "$current_mode" = "monitor" ]; then
-        log "debug" "Interface $interface is in monitor mode, switching to managed mode"
+    log "debug" "Current interface mode: $current_mode"
+    
+    if [ "$current_mode" != "managed" ]; then
+        log "info" "Setting interface $interface to managed mode"
         if ! iw dev "$interface" set type managed >/dev/null 2>&1; then
-            log "warn" "Failed to set interface to managed mode"
-            printf ""
+            log "error" "Failed to set interface to managed mode"
             return 1
         fi
-        # Bring interface back up after mode change
-        ip link set "$interface" up >/dev/null 2>&1
     fi
+    
+    # Bring interface up
+    if ! ifconfig "$interface" up >/dev/null 2>&1; then
+        log "error" "Failed to bring interface $interface up"
+        return 1
+    fi
+    
+    # Wait for interface to be ready
+    sleep 2
+    
+    # Check interface state
+    local interface_state
+    interface_state=$(ip link show "$interface" | grep -o "state [A-Z]*" | awk '{print $2}')
+    log "debug" "Interface state: $interface_state"
     
     log "info" "Starting WiFi scan on interface $interface"
     
     # Perform scan with timeout and proper error handling
     local scan_result
-    if ! scan_result=$(timeout 10 iw dev "$interface" scan 2>/dev/null); then
+    if ! scan_result=$(timeout 15 iw dev "$interface" scan 2>/dev/null); then
         log "error" "WiFi scan failed or timed out on interface $interface"
-        printf ""
         return 1
     fi
     
     # Check if scan result contains actual BSS entries
     if ! echo "$scan_result" | grep -q "^BSS"; then
         log "warn" "No wireless networks detected in scan"
-        printf ""
         return 1
     fi
     
@@ -423,31 +429,45 @@ scan_open_networks() {
             }
         }' | sort -nr | awk '{$1=""; sub(/^[[:space:]]+/, ""); print}')
     
-    # Filter and validate results
+    # Filter and validate results - be very strict
+    local valid_networks=""
     if [ -n "$networks" ]; then
-        # Remove any remaining empty lines and validate each network name
-        networks=$(echo "$networks" | grep -v '^[[:space:]]*$' | while read -r network; do
-            # Only output networks with reasonable names (no log timestamps, etc.)
-            if [ -n "$network" ] && [ ${#network} -le 32 ] && ! echo "$network" | grep -q '\[.*\]'; then
-                echo "$network"
+        # Process each line very carefully
+        while IFS= read -r network; do
+            # Skip empty lines
+            [ -z "$network" ] && continue
+            
+            # Skip lines with brackets (log messages)
+            echo "$network" | grep -q '\[' && continue
+            
+            # Skip lines with timestamps
+            echo "$network" | grep -q '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]' && continue
+            
+            # Skip lines that are too long for SSIDs
+            [ ${#network} -gt 32 ] && continue
+            
+            # Skip lines with log levels
+            echo "$network" | grep -qE '(info|error|warn|debug)' && continue
+            
+            # If we get here, it's likely a valid network name
+            if [ -z "$valid_networks" ]; then
+                valid_networks="$network"
+            else
+                valid_networks="$valid_networks"$'\n'"$network"
             fi
-        done)
+        done <<< "$networks"
     fi
     
     local network_count=0
-    if [ -n "$networks" ]; then
-        network_count=$(echo "$networks" | wc -l)
-    fi
-    
-    if [ "$network_count" -gt 0 ]; then
+    if [ -n "$valid_networks" ]; then
+        network_count=$(echo "$valid_networks" | wc -l)
         log "info" "Found $network_count open networks:"
-        echo "$networks" | while read -r network; do
+        echo "$valid_networks" | while read -r network; do
             [ -n "$network" ] && log "info" "  - $network"
         done
-        printf "%s" "$networks"
+        printf "%s" "$valid_networks"
     else
         log "warn" "No open networks found in scan"
-        printf ""
     fi
 }
 
@@ -718,14 +738,20 @@ scan_and_connect() {
         log "info" "=== SCAN ATTEMPT #$scan_attempt ==="
         log "info" "Scanning for open networks on interface $interface..."
         
+        # Call scan function and capture output properly
         local networks_output
-        networks_output=$(scan_open_networks "$interface")
+        networks_output=$(scan_open_networks "$interface" 2>/dev/null)
         
-        # Convert to array, filtering empty lines
+        # Convert to array, filtering empty lines and log patterns
         local networks=()
-        while IFS= read -r line; do
-            [ -n "$line" ] && networks+=("$line")
-        done <<< "$networks_output"
+        if [ -n "$networks_output" ]; then
+            while IFS= read -r line; do
+                # Skip empty lines and lines that look like log messages
+                if [ -n "$line" ] && ! echo "$line" | grep -q '\[.*\]' && [ ${#line} -le 32 ]; then
+                    networks+=("$line")
+                fi
+            done <<< "$networks_output"
+        fi
         
         if [ ${#networks[@]} -eq 0 ]; then
             log "warn" "SCAN RESULT: No open networks found in attempt #$scan_attempt"
