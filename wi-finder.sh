@@ -58,11 +58,20 @@ log() {
     
     # Only log if level is <= configured LOG_LEVEL
     if [ "$level_num" -le "$LOG_LEVEL" ]; then
-        # Only rotate logs occasionally to avoid overhead
-        if [ $((RANDOM % 100)) -eq 0 ]; then
-            rotate_logs
+        local log_message="[$timestamp] [$level] $message"
+        
+        # Check if running under systemd (which handles log redirection)
+        if [ -n "${SYSTEMD_EXEC_PID:-}" ] || [ -n "${INVOCATION_ID:-}" ]; then
+            # Running under systemd - just echo to stdout, systemd will handle logging
+            echo "$log_message"
+        else
+            # Running standalone - handle our own logging
+            # Only rotate logs occasionally to avoid overhead
+            if [ $((RANDOM % 100)) -eq 0 ]; then
+                rotate_logs
+            fi
+            echo "$log_message" | tee -a "$LOG_FILE"
         fi
-        echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
     fi
 }
 
@@ -942,6 +951,9 @@ monitoring_loop() {
 }
 
 main() {
+    # Clear log file at startup for fresh session
+    > "$LOG_FILE"
+    
     log "info" "=== WI-FINDER MAIN EXECUTION START ==="
     
     # Setup traps for clean exit
