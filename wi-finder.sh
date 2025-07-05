@@ -331,85 +331,108 @@ scan_open_networks() {
     # Validate interface parameter
     if [ -z "$interface" ]; then
         log "error" "No interface specified for WiFi scan"
+        printf ""  # Return empty result to stdout
         return 1
     fi
     
     # Validate interface exists
     if ! ip link show "$interface" >/dev/null 2>&1; then
         log "error" "Interface $interface does not exist"
+        printf ""
         return 1
     fi
     
-    log "info" "Starting WiFi scan on interface $interface"
+    # Ensure interface is up first
+    if ! ip link set "$interface" up >/dev/null 2>&1; then
+        log "error" "Failed to bring interface $interface up"
+        printf ""
+        return 1
+    fi
     
     # Check interface mode and set to managed if needed
     local current_mode
     current_mode=$(iw dev "$interface" info 2>/dev/null | grep "type" | awk '{print $2}')
     if [ "$current_mode" = "monitor" ]; then
-        log "info" "Interface $interface is in monitor mode, switching to managed mode for scanning"
-        if ! iw dev "$interface" set type managed 2>/dev/null; then
-            log "warn" "Failed to set interface to managed mode, attempting scan anyway"
+        log "debug" "Interface $interface is in monitor mode, switching to managed mode"
+        if ! iw dev "$interface" set type managed >/dev/null 2>&1; then
+            log "warn" "Failed to set interface to managed mode"
+            printf ""
+            return 1
         fi
+        # Bring interface back up after mode change
+        ip link set "$interface" up >/dev/null 2>&1
     fi
     
-    # Ensure interface is up
-    if ! ip link set "$interface" up 2>/dev/null; then
-        log "warn" "Failed to bring interface $interface up"
-    fi
+    log "info" "Starting WiFi scan on interface $interface"
     
-    # Scan and sort by signal strength (strongest first)
+    # Perform scan with timeout and proper error handling
     local scan_result
-    if ! scan_result=$(iw dev "$interface" scan 2>/dev/null); then
-        log "error" "WiFi scan failed on interface $interface - interface may not support scanning"
-        echo ""  # Return empty result
+    if ! scan_result=$(timeout 10 iw dev "$interface" scan 2>/dev/null); then
+        log "error" "WiFi scan failed or timed out on interface $interface"
+        printf ""
         return 1
     fi
     
     # Check if scan result contains actual BSS entries
     if ! echo "$scan_result" | grep -q "^BSS"; then
-        log "warn" "No BSS entries found in scan result"
-        echo ""
+        log "warn" "No wireless networks detected in scan"
+        printf ""
         return 1
     fi
     
+    # Parse networks using a more robust approach
     local networks
-    networks=$(echo "$scan_result" | \
-        awk '
-        BEGIN { ssid = ""; signal = ""; privacy = 0 }
+    networks=$(echo "$scan_result" | awk '
+        BEGIN {
+            ssid = ""; signal = ""; privacy = 0; bss_count = 0
+        }
         /^BSS/ {
-            # Process previous entry if complete
-            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/) {
+            # Process previous entry if complete and valid
+            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/ && length(ssid) <= 32) {
                 print signal " " ssid
+                bss_count++
             }
             # Reset for new BSS
             ssid = ""; signal = ""; privacy = 0
         }
         /SSID:/ {
-            gsub(/.*SSID: /, "");
-            gsub(/\t/, "");
-            gsub(/\r/, "");
-            # Skip empty, null, or hidden SSIDs
-            if ($0 != "" && $0 != "\\x00" && $0 !~ /^[[:space:]]*$/) {
+            # Extract SSID more carefully
+            sub(/.*SSID: /, "")
+            gsub(/[\t\r\n]/, "")
+            # Only accept valid SSIDs
+            if ($0 != "" && $0 != "\\x00" && $0 !~ /^[[:space:]]*$/ && length($0) <= 32) {
                 ssid = $0
             }
         }
         /signal:/ {
-            gsub(/.*signal: /, "");
-            gsub(/ dBm.*/, "");
-            if ($0 ~ /^-?[0-9]+$/) {
-                signal = $0
+            # Extract signal strength
+            sub(/.*signal: /, "")
+            sub(/ dBm.*/, "")
+            if ($0 ~ /^-?[0-9]+(\.[0-9]+)?$/) {
+                signal = int($0)
             }
         }
-        /capability:.*Privacy/ { privacy = 1 }
+        /capability:.*Privacy/ {
+            privacy = 1
+        }
         END {
             # Process final entry
-            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/) {
+            if (ssid && !privacy && signal && ssid !~ /^[[:space:]]*$/ && length(ssid) <= 32) {
                 print signal " " ssid
+                bss_count++
             }
-        }' | \
-        sort -nr | \
-        awk '{$1=""; gsub(/^[[:space:]]+/, ""); print}' | \
-        grep -v '^[[:space:]]*$')
+        }' | sort -nr | awk '{$1=""; sub(/^[[:space:]]+/, ""); print}')
+    
+    # Filter and validate results
+    if [ -n "$networks" ]; then
+        # Remove any remaining empty lines and validate each network name
+        networks=$(echo "$networks" | grep -v '^[[:space:]]*$' | while read -r network; do
+            # Only output networks with reasonable names (no log timestamps, etc.)
+            if [ -n "$network" ] && [ ${#network} -le 32 ] && ! echo "$network" | grep -q '\[.*\]'; then
+                echo "$network"
+            fi
+        done)
+    fi
     
     local network_count=0
     if [ -n "$networks" ]; then
@@ -421,10 +444,10 @@ scan_open_networks() {
         echo "$networks" | while read -r network; do
             [ -n "$network" ] && log "info" "  - $network"
         done
-        echo "$networks"
+        printf "%s" "$networks"
     else
         log "warn" "No open networks found in scan"
-        echo ""
+        printf ""
     fi
 }
 
