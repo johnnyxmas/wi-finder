@@ -76,13 +76,14 @@ if [ "${DEBUG:-0}" -eq 1 ]; then
 fi
 
 detect_network_service() {
-    if command -v systemd-networkd >/dev/null 2>&1; then
+    if systemctl list-unit-files systemd-networkd.service >/dev/null 2>&1; then
         echo "systemd-networkd"
     elif command -v NetworkManager >/dev/null 2>&1; then
         echo "network-manager"
     else
-        echo "systemd-networkd"
-        log "warn" "Neither systemd-networkd nor network-manager found. Will attempt to use systemd-networkd"
+        log "error" "No supported network management service found (systemd-networkd or NetworkManager)"
+        log "error" "Please install systemd or ensure NetworkManager is available"
+        exit 1
     fi
 }
 
@@ -102,17 +103,21 @@ install_dependencies() {
     NETWORK_SERVICE=$(detect_network_service)
     DHCP_CLIENT=$(detect_dhcp_client)
     
-    # Define packages to install (excluding systemd services)
+    # Define packages to install (never install NetworkManager)
     local base_pkgs=("iw" "wireless-tools" "iputils-ping" "curl" "arp-scan" "macchanger" "aircrack-ng")
     local pkgs=("${base_pkgs[@]}")
     
-    # Add network manager package if using NetworkManager
-    if [ "$NETWORK_SERVICE" = "network-manager" ]; then
-        pkgs+=("network-manager")
-    fi
-    
     # Add DHCP client package
     pkgs+=("$DHCP_CLIENT")
+    
+    # Verify NetworkManager is not in our install list
+    if [ "$NETWORK_SERVICE" = "network-manager" ]; then
+        log "info" "Using existing NetworkManager installation (will not install)"
+        if ! command -v NetworkManager >/dev/null 2>&1; then
+            log "error" "NetworkManager selected but not found on system"
+            exit 1
+        fi
+    fi
     
     local missing=()
     
@@ -126,13 +131,9 @@ install_dependencies() {
         fi
     done
     
-    # Check for systemd-networkd service availability (not a package)
+    # Verify systemd-networkd service availability (already checked in detect_network_service)
     if [ "$NETWORK_SERVICE" = "systemd-networkd" ]; then
-        if systemctl list-unit-files systemd-networkd.service >/dev/null 2>&1; then
-            log "debug" "Found systemd service: systemd-networkd"
-        else
-            log "warn" "systemd-networkd service not available on this system"
-        fi
+        log "debug" "Using systemd-networkd service"
     fi
 
     if [ ${#missing[@]} -ne 0 ]; then
